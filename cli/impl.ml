@@ -39,7 +39,7 @@ let info common filename =
             match Gpt.get gpt f with
               | Some v -> [ f; v ]
               | None -> failwith (f)
-            ) Gpt.all in
+            ) (Gpt.all gpt) in
             print_table ["field"; "value"] all;
             return ()
         ) in

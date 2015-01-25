@@ -31,6 +31,6 @@ end
 
 (* {1} Dynamically-typed query interface *)
 
-val all: string list
+val all: t -> string list
 
 val get: t -> string -> string option

@@ -143,6 +143,8 @@ type t = {
   last_usable_lba: int64;
   disk_guid: Uuidm.t;
   partitions: Partition.t list;
+  first_partition_entries_lba: int64;
+  number_partition_entries: int;
 }
 
 let make partitions =
@@ -150,9 +152,11 @@ let make partitions =
   let backup_lba = 0L in
   let first_usable_lba = 0L in
   let last_usable_lba = 0L in
+  let first_partition_entries_lba = 0L in
+  let number_partition_entries = 0 in
   let disk_guid = Uuidm.create `V4 in
   { current_lba; backup_lba; first_usable_lba; last_usable_lba;
-    disk_guid; partitions }
+    disk_guid; partitions; first_partition_entries_lba; number_partition_entries }
 
 (* GPT header format from wikipedia: *)
 cstruct gpt {
@@ -193,11 +197,11 @@ let unmarshal buf =
     | Some x -> return x
     | None -> fail (Printf.sprintf "Failed to parse disk_guid; got '%s'" disk_guid) ) >>= fun disk_guid ->
   let first_partition_entries_lba = get_gpt_first_partition_entries_lba buf in
-  let number_partition_entries = get_gpt_number_partition_entries buf in
+  let number_partition_entries = Int32.to_int (get_gpt_number_partition_entries buf) in
   let partition_entries_crc32 = get_gpt_partition_entries_crc32 buf in
   let partitions = [] in
   return { current_lba; backup_lba; first_usable_lba; last_usable_lba;
-    disk_guid; partitions }
+    disk_guid; partitions; first_partition_entries_lba; number_partition_entries }
 
 (* The datastructure is spread over the disk and of variable size;
    reading or writing therefore requires random access. *)
@@ -220,7 +224,29 @@ module Make(B: V1_LWT.BLOCK) = struct
         | `Ok mbr ->
           (* check that it's a protective MBR *)
           let buf = Cstruct.sub first2 info.B.sector_size info.B.sector_size in
-          return (unmarshal buf)
+          ( match unmarshal buf with
+            | `Error x -> return (`Error x)
+            | `Ok gpt ->
+              let npages = (Partition.sizeof * gpt.number_partition_entries + 4095) / 4096 in
+              let pbufs = Io_page.(to_cstruct (get npages)) in
+Printf.fprintf stderr "npages=%d\n%!" npages;
+              B.read b gpt.first_partition_entries_lba [ pbufs ]
+              >>= function
+              | `Error x -> return (`Error "Failed to read partition table")
+              | `Ok () ->
+                let rec loop acc remaining = function
+                | 0 -> `Ok acc
+                | n ->
+                  begin match Partition.unmarshal remaining with
+                  | `Error x -> `Error x
+                  | `Ok p -> loop (p :: acc) (Cstruct.shift remaining Partition.sizeof) (n - 1)
+                  end in
+                ( match loop [] pbufs gpt.number_partition_entries with
+                  | `Ok partitions -> 
+                    return (`Ok { gpt with partitions })
+                  | `Error x ->
+                    return (`Error x) )
+          )
       )
 
   let marshal t (b: B.t) =
@@ -233,15 +259,16 @@ let _first_usable_lba = "first-usable-lba"
 let _last_usable_lba = "last-usable-lba"
 let _disk_guid = "disk-guid"
 let _partition = "partition"
-let all = [
+let all t =
+  let rec count i = function
+  | [] -> []
+  | _ :: rest -> i :: (count (i + 1) rest) in [
   _current_lba;
   _backup_lba;
   _first_usable_lba;
   _last_usable_lba;
   _disk_guid;
-]
-(* @ (List.concat (List.map (fun i -> List.map (fun k -> Printf.sprintf "%s/%d/%s" _partition i k) Partition.all) [0;1;2;3]))
-*)
+] @ (List.concat (List.map (fun i -> List.map (fun k -> Printf.sprintf "%s/%d/%s" _partition i k) Partition.all) (count 0 t.partitions)))
 
 let slash = Re_str.regexp_string "/"
 
