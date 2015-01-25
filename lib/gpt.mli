@@ -23,7 +23,7 @@ type t
 
 module Make(B: V1_LWT.BLOCK): sig
 
-  val unmarshal: B.t -> t Lwt.t
+  val unmarshal: B.t -> (t, string) result Lwt.t
 
   val marshal: t -> B.t -> (unit, string) result Lwt.t
 

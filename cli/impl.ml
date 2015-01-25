@@ -31,15 +31,18 @@ let info common filename =
       >>= function
       | `Error _ -> fail (Failure "Unable to open block device")
       | `Ok block ->
-        G.unmarshal block
-        >>= fun gpt ->
-        let all = List.map (fun f ->
-        match Gpt.get gpt f with
-          | Some v -> [ f; v ]
-          | None -> assert false
-        ) Gpt.all in
-        print_table ["field"; "value"] all;
-        return () in
+        ( G.unmarshal block
+          >>= function
+          | `Error x -> fail (Failure x)
+          | `Ok gpt ->
+            let all = List.map (fun f ->
+            match Gpt.get gpt f with
+              | Some v -> [ f; v ]
+              | None -> failwith (f)
+            ) Gpt.all in
+            print_table ["field"; "value"] all;
+            return ()
+        ) in
     Lwt_main.run t;
     `Ok ()
   with Failure x ->

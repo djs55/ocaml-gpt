@@ -73,10 +73,10 @@ module Partition = struct
     ( if Cstruct.len buf < sizeof_part
       then fail (Printf.sprintf "partition entry too small: %d < %d" (Cstruct.len buf) sizeof_part)
       else return () ) >>= fun () ->
-    ( match Uuidm.of_string (copy_part_type_guid buf) with
+    ( match Uuidm.of_bytes (copy_part_type_guid buf) with
       | None -> fail (Printf.sprintf "type is not a uuid: %s" (copy_part_type_guid buf))
       | Some x -> return x ) >>= fun ty ->
-    ( match Uuidm.of_string (copy_part_unique_guid buf) with
+    ( match Uuidm.of_bytes (copy_part_unique_guid buf) with
       | None -> fail (Printf.sprintf "guid is not a uuid: %s" (copy_part_unique_guid buf))
       | Some x -> return x ) >>= fun guid ->
     let first_lba = get_part_first_lba buf in
@@ -90,8 +90,8 @@ module Partition = struct
       efi_should_ignore; legacy_bios_bootable; name }
 
   let marshal (buf: Cstruct.t) t =
-    set_part_type_guid (Uuidm.to_string t.ty) 0 buf;
-    set_part_unique_guid (Uuidm.to_string t.guid) 0 buf;
+    set_part_type_guid (Uuidm.to_bytes t.ty) 0 buf;
+    set_part_unique_guid (Uuidm.to_bytes t.guid) 0 buf;
     set_part_first_lba buf t.first_lba;
     set_part_last_lba buf t.last_lba;
     let flags =
@@ -172,6 +172,33 @@ cstruct gpt {
   (* zeroes for the rest of the block *)
 } as little_endian
 
+let unmarshal buf =
+  let signature = copy_gpt_signature buf in
+  ( match signature with
+    | "EFI PART" -> return ()
+    | x -> fail (Printf.sprintf "Signature not found; expected 'EFI PART' got '%s" x) ) >>= fun () ->
+  let revision = get_gpt_revision buf in
+  ( match revision with
+    | 0x010000l -> return ()
+    | x -> fail (Printf.sprintf "Unknown revision; expected 0x10000 got %lx" x) ) >>= fun () ->
+
+  let header_size = get_gpt_header_size buf in
+  let header_crc32 = get_gpt_header_crc32 buf in
+  let current_lba = get_gpt_current_lba buf in
+  let backup_lba = get_gpt_backup_lba buf in
+  let first_usable_lba = get_gpt_first_usable_lba buf in
+  let last_usable_lba = get_gpt_last_usable_lba buf in
+  let disk_guid = copy_gpt_disk_guid buf in
+  ( match Uuidm.of_bytes disk_guid with
+    | Some x -> return x
+    | None -> fail (Printf.sprintf "Failed to parse disk_guid; got '%s'" disk_guid) ) >>= fun disk_guid ->
+  let first_partition_entries_lba = get_gpt_first_partition_entries_lba buf in
+  let number_partition_entries = get_gpt_number_partition_entries buf in
+  let partition_entries_crc32 = get_gpt_partition_entries_crc32 buf in
+  let partitions = [] in
+  return { current_lba; backup_lba; first_usable_lba; last_usable_lba;
+    disk_guid; partitions }
+
 (* The datastructure is spread over the disk and of variable size;
    reading or writing therefore requires random access. *)
 module Make(B: V1_LWT.BLOCK) = struct
@@ -180,7 +207,21 @@ module Make(B: V1_LWT.BLOCK) = struct
   let unmarshal (b: B.t) =
     B.get_info b
     >>= fun info ->
-    return (make [])
+    (* we need lba0 and lba1 *)
+    let npages = (info.B.sector_size * 2 + 4095) / 4096 in
+    let first2 = Io_page.(to_cstruct (get npages)) in
+    B.read b 0L [ first2 ]
+    >>= function
+    | `Error _ ->
+      return (`Error "Failed to read first 8KiB from disk")
+    | `Ok () ->
+      ( match Mbr.unmarshal (Cstruct.sub first2 0 512) with
+        | `Error x -> return (`Error x)
+        | `Ok mbr ->
+          (* check that it's a protective MBR *)
+          let buf = Cstruct.sub first2 info.B.sector_size info.B.sector_size in
+          return (unmarshal buf)
+      )
 
   let marshal t (b: B.t) =
     return (`Error "unimplemented")
@@ -198,7 +239,9 @@ let all = [
   _first_usable_lba;
   _last_usable_lba;
   _disk_guid;
-] @ (List.concat (List.map (fun i -> List.map (fun k -> Printf.sprintf "%s/%d/%s" _partition i k) Partition.all) [0;1;2;3]))
+]
+(* @ (List.concat (List.map (fun i -> List.map (fun k -> Printf.sprintf "%s/%d/%s" _partition i k) Partition.all) [0;1;2;3]))
+*)
 
 let slash = Re_str.regexp_string "/"
 
