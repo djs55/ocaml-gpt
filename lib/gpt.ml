@@ -30,77 +30,42 @@ let kib = 1024L
 let mib = Int64.mul kib 1024L
 let gib = Int64.mul mib 1024L
 
-module Geometry = struct
-  type t = {
-    cylinders : int;
-    heads : int;
-    sectors : int;
-  }
-
-  let to_string t = Printf.sprintf "{ cylinders = %d; heads = %d; sectors = %d }" t.cylinders t.heads t.sectors
-
-  let unmarshal buf =
-    ( if Cstruct.len buf < 3
-      then fail (Printf.sprintf "geometry too small: %d < %d" (Cstruct.len buf) 3)
-      else return () ) >>= fun () ->
-    let heads = Cstruct.get_uint8 buf 0 in
-    let y = Cstruct.get_uint8 buf 1 in
-    let z = Cstruct.get_uint8 buf 2 in
-    let sectors = y land 0b0111111 in
-    let cylinders = (y lsl 2) lor z in
-    return { cylinders; heads; sectors }
-
-  let of_lba_size x =
-    let sectors = 63 in
-    ( if x < Int64.(mul 504L mib)
-      then return 16
-      else if x < Int64.(mul 1008L mib)
-      then return 64
-      else if x < Int64.(mul 4032L mib)
-      then return 128
-      else if x < Int64.(add (mul 8032L mib) (mul 512L kib))
-      then return 255
-      else fail (Printf.sprintf "sector count exceeds LBA max: %Ld" x) ) >>= fun heads ->
-    let cylinders = Int64.(to_int (div (div x (of_int sectors)) (of_int heads))) in
-    return { cylinders; heads; sectors }
-
-  let to_chs g x =
-    let open Int64 in
-    let cylinders = to_int (div x (mul (of_int g.sectors) (of_int g.heads))) in
-    let heads = to_int (rem (div x (of_int g.sectors)) (of_int g.heads)) in
-    let sectors = to_int (succ (rem x (of_int g.sectors))) in
-    { cylinders; heads; sectors }
-end
-
 module Partition = struct
   type t = {
-    active: bool;
-    first_absolute_sector_chs: Geometry.t;
-    ty: int;
-    last_absolute_sector_chs: Geometry.t;
-    first_absolute_sector_lba: int32;
-    sectors: int32;
+    ty: Uuidm.t;
+    guid: Uuidm.t;
+    first_lba: int64;
+    last_lba: int64;
+    system_partition: bool;
+    efi_should_ignore: bool;
+    legacy_bios_bootable: bool;
+    name: string;
   }
 
-  let make ?(active=false) ?(ty=6) first_absolute_sector_lba sectors =
-    let first_absolute_sector_chs = { Geometry.cylinders = 0; heads = 0; sectors = 0; } in
-    let last_absolute_sector_chs = first_absolute_sector_chs in
-    { active; first_absolute_sector_chs; ty;
-      last_absolute_sector_chs;
-      first_absolute_sector_lba;
-      sectors }
+  let microsoft_basic_data_partition =
+    let uuid = "EBD0A0A2-B9E5-4433-87C0-68B6B72699C7" in
+    match Uuidm.of_string uuid with
+    | Some x -> x
+    | None -> failwith (Printf.sprintf "Microsoft and Uuidm seem to disagree on whether %s is a uuid or not" uuid)
+
+  let make ?(legacy_bios_bootable=false) ?(ty=microsoft_basic_data_partition) first_lba last_lba =
+    let guid = Uuidm.create `V4 in
+    let system_partition = false in
+    let efi_should_ignore = false in
+    let name = "" in
+    { ty; guid; first_lba; last_lba; system_partition; efi_should_ignore; legacy_bios_bootable;
+      name }
 
   cstruct part {
-    uint8_t status;
-    uint8_t first_absolute_sector_chs[3];
-    uint8_t ty;
-    uint8_t last_absolute_sector_chs[3];
-    uint32_t first_absolute_sector_lba;
-    uint32_t sectors
-
+    uint8_t type_guid[16];
+    uint8_t unique_guid[16];
+    uint64_t first_lba;
+    uint64_t last_lba;
+    uint64_t flags;
+    uint8_t name[72];
   } as little_endian
 
-  let _ = assert (sizeof_part = 16)
+  let _ = assert (sizeof_part = 128)
 
   let sizeof = sizeof_part
 
@@ -108,159 +73,146 @@ module Partition = struct
     ( if Cstruct.len buf < sizeof_part
       then fail (Printf.sprintf "partition entry too small: %d < %d" (Cstruct.len buf) sizeof_part)
       else return () ) >>= fun () ->
-    let active = get_part_status buf = 0x80 in
-    Geometry.unmarshal (get_part_first_absolute_sector_chs buf) >>= fun first_absolute_sector_chs ->
-    let ty = get_part_ty buf in
-    Geometry.unmarshal (get_part_last_absolute_sector_chs buf) >>= fun last_absolute_sector_chs ->
-    let first_absolute_sector_lba = get_part_first_absolute_sector_lba buf in
-    let sectors = get_part_sectors buf in
-    return { active; first_absolute_sector_chs; ty;
-      last_absolute_sector_chs; first_absolute_sector_lba;
-      sectors }
+    ( match Uuidm.of_string (copy_part_type_guid buf) with
+      | None -> fail (Printf.sprintf "type is not a uuid: %s" (copy_part_type_guid buf))
+      | Some x -> return x ) >>= fun ty ->
+    ( match Uuidm.of_string (copy_part_unique_guid buf) with
+      | None -> fail (Printf.sprintf "guid is not a uuid: %s" (copy_part_unique_guid buf))
+      | Some x -> return x ) >>= fun guid ->
+    let first_lba = get_part_first_lba buf in
+    let last_lba = get_part_last_lba buf in
+    let flags = get_part_flags buf in
+    let system_partition = Int64.(logand flags 1L) <> 0L in
+    let efi_should_ignore = Int64.(logand flags 2L) <> 0L in
+    let legacy_bios_bootable = Int64.(logand flags 4L) <> 0L in
+    let name = copy_part_name buf in
+    return { ty; guid; first_lba; last_lba; system_partition;
+      efi_should_ignore; legacy_bios_bootable; name }
 
   let marshal (buf: Cstruct.t) t =
-    set_part_status buf (if t.active then 0x80 else 0);
-    set_part_ty buf t.ty;
-    set_part_first_absolute_sector_lba buf t.first_absolute_sector_lba;
-    set_part_sectors buf t.sectors
+    set_part_type_guid (Uuidm.to_string t.ty) 0 buf;
+    set_part_unique_guid (Uuidm.to_string t.guid) 0 buf;
+    set_part_first_lba buf t.first_lba;
+    set_part_last_lba buf t.last_lba;
+    let flags =
+      (if t.system_partition then 1 else 0)
+      lor (if t.efi_should_ignore then 2 else 0)
+      lor (if t.legacy_bios_bootable then 4 else 0) in
+    set_part_flags buf (Int64.of_int flags);
+    set_part_name t.name 0 buf
 
-  let _active = "active"
-  let _first_absolute_sector_chs = "first-absolute-sector-chs"
   let _ty = "type"
-  let _last_absolute_sector_chs = "last-absolute-sector-chs"
-  let _first_absolute_sector_lba = "first-absolute-sector-lba"
-  let _sectors = "sectors"
+  let _guid = "guid"
+  let _first_lba = "first-lba"
+  let _last_lba = "last-lba"
+  let _system_partition = "system-partition"
+  let _efi_should_ignore = "efi-should-ignore"
+  let _legacy_bios_bootable = "legacy-bios-bootable"
+  let _name = "name"
 
-  let all = [ _active; _first_absolute_sector_chs; _ty;
-    _last_absolute_sector_chs; _first_absolute_sector_lba;
-    _sectors;
+  let all = [ _ty; _guid; _first_lba; _last_lba;
+    _system_partition; _efi_should_ignore; _legacy_bios_bootable;
+    _name
   ]
 
   let get t key =
-    if key = _active
-    then Some (string_of_bool t.active)
-    else if key = _first_absolute_sector_chs
-    then Some (Geometry.to_string t.first_absolute_sector_chs)
-    else if key = _ty
-    then Some (string_of_int t.ty)
-    else if key = _last_absolute_sector_chs
-    then Some (Geometry.to_string t.last_absolute_sector_chs)
-    else if key = _first_absolute_sector_lba
-    then Some (Int32.to_string t.first_absolute_sector_lba)
-    else if key = _sectors
-    then Some (Int32.to_string t.sectors)
+    if key = _ty
+    then Some (Uuidm.to_string t.ty)
+    else if key = _guid
+    then Some (Uuidm.to_string t.guid)
+    else if key = _first_lba
+    then Some (Int64.to_string t.first_lba)
+    else if key = _last_lba
+    then Some (Int64.to_string t.last_lba)
+    else if key = _system_partition
+    then Some (string_of_bool t.system_partition)
+    else if key = _efi_should_ignore
+    then Some (string_of_bool t.efi_should_ignore)
+    else if key = _legacy_bios_bootable
+    then Some (string_of_bool t.legacy_bios_bootable)
+    else if key = _name
+    then Some t.name
     else None
 
 end
 
 type t = {
-  bootstrap_code: Cstruct.t * Cstruct.t;
-  original_physical_drive: int;
-  seconds: int;
-  minutes: int;
-  hours: int;
-  disk_signature: int32;
+  current_lba: int64;
+  backup_lba: int64;
+  first_usable_lba: int64;
+  last_usable_lba: int64;
+  disk_guid: Uuidm.t;
   partitions: Partition.t list;
 }
 
 let make partitions =
-  let bootstrap_code = Cstruct.create 218, Cstruct.create 216 in
-  let original_physical_drive = 0 in
-  let seconds = 0 in
-  let minutes = 0 in
-  let hours = 0 in
-  let disk_signature = 0l in
-  { bootstrap_code; original_physical_drive;
-    seconds; minutes; hours; disk_signature;
-    partitions }
+  let current_lba = 0L in
+  let backup_lba = 0L in
+  let first_usable_lba = 0L in
+  let last_usable_lba = 0L in
+  let disk_guid = Uuidm.create `V4 in
+  { current_lba; backup_lba; first_usable_lba; last_usable_lba;
+    disk_guid; partitions }
 
-(* "modern standard" MBR from wikipedia: *)
-cstruct mbr {
-  uint8_t bootstrap_code1[218];
-  uint8_t _zeroes_1[2];
-  uint8_t original_physical_drive;
-  uint8_t seconds;
-  uint8_t minutes;
-  uint8_t hours;
-  uint8_t bootstrap_code2[216];
-  uint32_t disk_signature;
-  uint8_t _zeroes_2[2];
-  uint8_t partitions[64];
-  uint8_t signature1; (* 0x55 *)
-  uint8_t signature2  (* 0xaa *)
+(* GPT header format from wikipedia: *)
+cstruct gpt {
+  uint8_t signature[8];
+  uint32_t revision;
+  uint32_t header_size;
+  uint32_t header_crc32;
+  uint32_t reserved;
+  uint64_t current_lba;
+  uint64_t backup_lba;
+  uint64_t first_usable_lba;
+  uint64_t last_usable_lba;
+  uint16_t disk_guid[16];
+  uint64_t first_partition_entries_lba;
+  uint32_t number_partition_entries;
+  uint32_t partition_entries_crc32;
+  (* zeroes for the rest of the block *)
 } as little_endian
 
-let _ = assert(sizeof_mbr = 512)
+(* The datastructure is spread over the disk and of variable size;
+   reading or writing therefore requires random access. *)
+module Make(B: V1_LWT.BLOCK) = struct
+  open Lwt
 
-let unmarshal (buf: Cstruct.t) : (t, string) result =
-    ( if Cstruct.len buf < sizeof_mbr
-      then fail (Printf.sprintf "MBR too small: %d < %d" (Cstruct.len buf) sizeof_mbr)
-      else return () ) >>= fun () ->
-    let signature1 = get_mbr_signature1 buf in
-    let signature2 = get_mbr_signature2 buf in
-    ( if signature1 = 0x55 && (signature2 = 0xaa)
-      then return ()
-      else fail (Printf.sprintf "Invalid signature: %02x %02x <> 0x55 0xaa" signature1 signature2) ) >>= fun () ->
-    let bootstrap_code = get_mbr_bootstrap_code1 buf, get_mbr_bootstrap_code2 buf in
-    let original_physical_drive = get_mbr_original_physical_drive buf in
-    let seconds = get_mbr_seconds buf in
-    let minutes = get_mbr_minutes buf in
-    let hours = get_mbr_hours buf in
-    let disk_signature = get_mbr_disk_signature buf in
-    let partitions = get_mbr_partitions buf in
-    Partition.unmarshal (Cstruct.shift partitions (0 * Partition.sizeof)) >>= fun p1 ->
-    Partition.unmarshal (Cstruct.shift partitions (1 * Partition.sizeof)) >>= fun p2 ->
-    Partition.unmarshal (Cstruct.shift partitions (2 * Partition.sizeof)) >>= fun p3 ->
-    Partition.unmarshal (Cstruct.shift partitions (3 * Partition.sizeof)) >>= fun p4 ->
-    let partitions = [ p1; p2; p3; p4 ] in
-    return { bootstrap_code;
-      original_physical_drive; seconds; minutes; hours;
-      disk_signature;
-      partitions }
+  let unmarshal (b: B.t) =
+    B.get_info b
+    >>= fun info ->
+    return (make [])
 
-let marshal (buf: Cstruct.t) t =
-  set_mbr_bootstrap_code1 (Cstruct.to_string (fst t.bootstrap_code)) 0 buf;
-  set_mbr_bootstrap_code2 (Cstruct.to_string (snd t.bootstrap_code)) 0 buf;
-  set_mbr_original_physical_drive buf t.original_physical_drive;
-  set_mbr_seconds buf t.seconds;
-  set_mbr_minutes buf t.minutes;
-  set_mbr_hours buf t.hours;
-  set_mbr_disk_signature buf t.disk_signature;
-  let partitions = get_mbr_partitions buf in
-  let _ = List.fold_left (fun buf p ->
-    Partition.marshal buf p;
-    Cstruct.shift buf Partition.sizeof
-  ) partitions t.partitions in
-  set_mbr_signature1 buf 0x55;
-  set_mbr_signature2 buf 0xaa
+  let marshal t (b: B.t) =
+    return (`Error "unimplemented")
+end
 
-let sizeof = sizeof_mbr
-
-let default_partition_start = 2048l
-
-let _bootstrap_code = "bootstrap-code"
-let _original_physical_drive = "original-physical-drive"
-let _timestamp = "timestamp"
-let _disk_signature = "disk-signature"
+let _current_lba = "current-lba"
+let _backup_lba = "backup-lba"
+let _first_usable_lba = "first-usable-lba"
+let _last_usable_lba = "last-usable-lba"
+let _disk_guid = "disk-guid"
 let _partition = "partition"
 let all = [
-  _bootstrap_code;
-  _original_physical_drive;
-  _timestamp;
-  _disk_signature;
+  _current_lba;
+  _backup_lba;
+  _first_usable_lba;
+  _last_usable_lba;
+  _disk_guid;
 ] @ (List.concat (List.map (fun i -> List.map (fun k -> Printf.sprintf "%s/%d/%s" _partition i k) Partition.all) [0;1;2;3]))
 
 let slash = Re_str.regexp_string "/"
 
 let get t key =
-  if key = _bootstrap_code
-  then Some "code omitted"
-  else if key = _original_physical_drive
-  then Some (string_of_int t.original_physical_drive)
-  else if key = _timestamp
-  then Some (Printf.sprintf "%02d:%02d:%02d" t.hours t.minutes t.seconds)
-  else if key = _disk_signature
-  then Some (Int32.to_string t.disk_signature)
+  if key = _current_lba
+  then Some (Int64.to_string t.current_lba)
+  else if key = _backup_lba
+  then Some (Int64.to_string t.backup_lba)
+  else if key = _first_usable_lba
+  then Some (Int64.to_string t.first_usable_lba)
+  else if key = _last_usable_lba
+  then Some (Int64.to_string t.last_usable_lba)
+  else if key = _disk_guid
+  then Some (Uuidm.to_string t.disk_guid)
   else begin match Re_str.split slash key with
    | [ p; i; k ] when p = _partition ->
      begin
